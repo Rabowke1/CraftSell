@@ -1,0 +1,16 @@
+## Interface: 16001, 11508, 11509, 20506, 38000
+## Title: CraftSell
+## Notes: Zeigt im Berufsfenster, welches Rezept beim HAENDLER den meisten Gewinn bringt (Materialpreise aus Auctionator/Auctioneer).
+## Author: CraftSell
+## Version: 1.4.0
+## SavedVariables: CraftSellDB
+## OptionalDeps: Auctionator, Auc-Advanced
+## IconTexture: Interface\Icons\INV_Misc_Coin_02
+
+Prices.lua
+Ledger.lua
+Seller.lua
+Navigate.lua
+Panel.lua
+Core.lua
+Minimap.lua
