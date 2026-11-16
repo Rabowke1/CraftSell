@@ -1,6 +1,7 @@
 -- CraftSell: "sell crafted items" button on the merchant window.
 -- Sells only items in your bags (never equipped or bank items) that are
--- products of your learned recipes, are NOT used as a reagent by any of
+-- products of your learned recipes, carry "<Hergestellt von NAME>" of the
+-- current character in their tooltip, are NOT used as a reagent by any of
 -- your recipes, have a vendor value and are not on the keep list.
 local ADDON, ns = ...
 local P = ns.Prices
@@ -34,14 +35,62 @@ local function UseItem(bag, slot)
   end
 end
 
-local function Sellable(itemID, locked, noValue)
+-- True only if the item's tooltip carries "<Hergestellt von NAME>" with the
+-- name of the current character. Looted, bought or traded copies of an item
+-- you could craft do not have that line and are left alone.
+local function StripColor(s)
+  return (s:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""))
+end
+
+-- The tooltip shows the full name ("Julie Morrigan"), UnitName only the
+-- first name ("Julie"): accept the exact name or the name plus a surname.
+local function IsMyLine(text)
+  local fmt = StripColor(ITEM_CREATED_BY or "<Hergestellt von %s>")
+  local pre, post = fmt:match("^(.-)%%s(.*)$")
+  if not pre then return false end
+  text = StripColor(text)
+  local s, e = text:find(pre, 1, true)
+  if not s then return false end
+  local creator = text:sub(e + 1)
+  if post ~= "" then
+    local ps = creator:find(post, 1, true)
+    if ps then creator = creator:sub(1, ps - 1) end
+  end
+  local me = UnitName("player") or "?"
+  return creator == me or creator:sub(1, #me + 1) == me .. " "
+end
+
+local scanTip
+local function MadeByMe(bag, slot)
+  if C_TooltipInfo and C_TooltipInfo.GetBagItem then
+    local data = C_TooltipInfo.GetBagItem(bag, slot)
+    for _, line in ipairs(data and data.lines or {}) do
+      if not line.leftText and TooltipUtil and TooltipUtil.SurfaceArgs then TooltipUtil.SurfaceArgs(line) end
+      if line.leftText and IsMyLine(line.leftText) then return true end
+    end
+    return false
+  end
+  scanTip = scanTip or CreateFrame("GameTooltip", "CraftSellScanTip", nil, "GameTooltipTemplate")
+  scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
+  scanTip:SetBagItem(bag, slot)
+  for i = 1, scanTip:NumLines() do
+    local fs = _G["CraftSellScanTipTextLeft" .. i]
+    local text = fs and fs:GetText()
+    if text and IsMyLine(text) then return true end
+  end
+  return false
+end
+
+local function Sellable(itemID, locked, noValue, bag, slot)
   if not itemID or locked or noValue then return false end
   local db = CraftSellDB
   if not (db.craftedIDs and db.craftedIDs[itemID]) then return false end
   if db.reagentIDs and db.reagentIDs[itemID] then return false end   -- material / intermediate
   if db.keep and db.keep[itemID] then return false end
   local sell = P.GetVendorSellPrice(itemID)
-  return sell and sell > 0, sell
+  if not (sell and sell > 0) then return false end
+  if not MadeByMe(bag, slot) then return false end
+  return true, sell
 end
 
 -- Returns list of { bag, slot, itemID, count, value, link }, total value, total count
@@ -51,7 +100,7 @@ function S.Collect()
   for bag = BACKPACK, NUM_BAGS do
     for slot = 1, NumSlots(bag) do
       local itemID, stack, locked, noValue, link = SlotInfo(bag, slot)
-      local ok, sell = Sellable(itemID, locked, noValue)
+      local ok, sell = Sellable(itemID, locked, noValue, bag, slot)
       if ok then
         list[#list + 1] = { bag = bag, slot = slot, itemID = itemID, count = stack, value = sell * stack, link = link }
         total = total + sell * stack
@@ -74,7 +123,7 @@ function S.SellAll()
     if sold >= MAX_PER_CLICK then break end
     -- re-check the slot right before selling (bags may have changed)
     local itemID, _, locked = SlotInfo(e.bag, e.slot)
-    if itemID == e.itemID and not locked then
+    if itemID == e.itemID and not locked and MadeByMe(e.bag, e.slot) then
       UseItem(e.bag, e.slot)
       sold = sold + 1
       value = value + e.value
@@ -121,7 +170,7 @@ local function CreateButton()
   button:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:AddLine("CraftSell – hergestellte Gegenstände verkaufen")
-    GameTooltip:AddLine("Nur Gegenstände aus deinen Taschen (nicht angelegt, nicht Bank), die deine Rezepte herstellen. Materialien und Zwischenprodukte bleiben liegen.", 1, 1, 1, true)
+    GameTooltip:AddLine("Nur Gegenstände aus deinen Taschen (nicht angelegt, nicht Bank), die laut Tooltip von diesem Charakter hergestellt wurden (\"Hergestellt von ...\"). Materialien und Zwischenprodukte bleiben liegen.", 1, 1, 1, true)
     GameTooltip:AddLine("Pro Klick max. 12 Stapel – alles bleibt über \"Rückkauf\" zurückkaufbar.", 0.6, 1, 0.6, true)
     local list, total = S.Collect()
     if #list > 0 then

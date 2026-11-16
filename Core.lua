@@ -8,6 +8,33 @@ local P = ns.Prices
 
 local DIFFICULTY = { [0] = "optimal", [1] = "medium", [2] = "easy", [3] = "trivial" }
 
+-- Output item, average amount made and mandatory reagents of a recipe (spell
+-- ID) via C_TradeSkillUI; nil when the client has no schematic for it.
+function ns.ReadSchematic(recipeID)
+  if not (C_TradeSkillUI and C_TradeSkillUI.GetRecipeSchematic) then return nil end
+  local ok, schematic = pcall(C_TradeSkillUI.GetRecipeSchematic, recipeID, false)
+  local output = ok and schematic and schematic.outputItemID
+  if not output then return nil end
+  local lo = schematic.quantityMin or 1
+  if lo < 1 then lo = 1 end
+  local hi = schematic.quantityMax or lo
+  if hi < lo then hi = lo end
+  local isBasic = Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic
+  local reagents = {}
+  for _, slot in ipairs(schematic.reagentSlotSchematics or {}) do
+    local first = slot.reagents and slot.reagents[1]
+    local mandatory = slot.required or (isBasic ~= nil and slot.reagentType == isBasic)
+    if mandatory and first and first.itemID then
+      reagents[#reagents + 1] = {
+        item = first.itemID,
+        count = slot.quantityRequired or 1,
+        icon = C_Item.GetItemIconByID and C_Item.GetItemIconByID(first.itemID),
+      }
+    end
+  end
+  return output, (lo + hi) / 2, reagents
+end
+
 -- ---------------------------------------------------------------------------
 -- Modern profession window (ProfessionsFrame / C_TradeSkillUI) – used by the
 -- "Forever" client. Returns ALL learned recipes, regardless of collapsed
@@ -26,43 +53,33 @@ local ModernAdapter = {
       ns.pendingItemData = true
       return out
     end
-    local isBasic = Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic
+    -- Not yet learned recipes (if the client lists them): their reagents are
+    -- needed to rate recipes you could learn at the trainer (Learn.lua).
+    local unlearned = {}
     for _, recipeID in ipairs(C_TradeSkillUI.GetAllRecipeIDs() or {}) do
       local info = C_TradeSkillUI.GetRecipeInfo(recipeID)
-      if info and info.learned and not info.isDummyRecipe and not info.isRecraft and not info.isSalvageRecipe then
-        local schematic = C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
-        local output = schematic and schematic.outputItemID
+      if info and not info.isDummyRecipe and not info.isRecraft and not info.isSalvageRecipe then
+        local output, made, reagents = ns.ReadSchematic(recipeID)
         if output then
-          local lo = schematic.quantityMin or 1
-          if lo < 1 then lo = 1 end
-          local hi = schematic.quantityMax or lo
-          if hi < lo then hi = lo end
-          local reagents = {}
-          for _, slot in ipairs(schematic.reagentSlotSchematics or {}) do
-            local first = slot.reagents and slot.reagents[1]
-            local mandatory = slot.required or (isBasic ~= nil and slot.reagentType == isBasic)
-            if mandatory and first and first.itemID then
-              reagents[#reagents + 1] = {
-                item = first.itemID,
-                count = slot.quantityRequired or 1,
-                icon = C_Item.GetItemIconByID and C_Item.GetItemIconByID(first.itemID),
-              }
-            end
-          end
-          out[#out + 1] = {
+          local rec = {
             id = recipeID,
             name = info.name,
             kind = DIFFICULTY[info.relativeDifficulty],
             numAvailable = info.numAvailable or 0,
             icon = info.icon,
             output = output,
-            made = (lo + hi) / 2,
+            made = made,
             reagents = reagents,
           }
+          if info.learned then
+            out[#out + 1] = rec
+          else
+            unlearned[#unlearned + 1] = rec
+          end
         end
       end
     end
-    if ns.CacheRecipes then ns.CacheRecipes(out) end
+    if ns.CacheRecipes then ns.CacheRecipes(out, unlearned) end
     return out
   end,
   Select = function(recipeID)
@@ -201,14 +218,9 @@ local function CurrentProfessionName()
   local title = tc and tc:GetText()
   if title and title ~= "" then return title end
 end
+ns.CurrentProfessionName = CurrentProfessionName
 
-function ns.CacheRecipes(list)
-  if #list == 0 then return end
-  local prof = CurrentProfessionName()
-  if not prof then return end
-  local char = ns.Ledger.CharKey()
-  CraftSellDB.cache = CraftSellDB.cache or {}
-  CraftSellDB.cache[char] = CraftSellDB.cache[char] or {}
+local function CopyRecipes(list)
   local copy = {}
   for i, rec in ipairs(list) do
     local reagents = {}
@@ -220,7 +232,21 @@ function ns.CacheRecipes(list)
       output = rec.output, made = rec.made, reagents = reagents,
     }
   end
-  CraftSellDB.cache[char][prof] = { recipes = copy, time = time() }
+  return copy
+end
+
+function ns.CacheRecipes(list, unlearned)
+  if #list == 0 then return end
+  local prof = CurrentProfessionName()
+  if not prof then return end
+  local char = ns.Ledger.CharKey()
+  CraftSellDB.cache = CraftSellDB.cache or {}
+  CraftSellDB.cache[char] = CraftSellDB.cache[char] or {}
+  CraftSellDB.cache[char][prof] = {
+    recipes = CopyRecipes(list),
+    unlearned = unlearned and #unlearned > 0 and CopyRecipes(unlearned) or nil,
+    time = time(),
+  }
   CraftSellDB.cacheSelected = CraftSellDB.cacheSelected or {}
   CraftSellDB.cacheSelected[char] = prof
 end
@@ -299,16 +325,11 @@ local CacheAdapter = {
 }
 
 -- ---------------------------------------------------------------------------
--- Price every recipe and rank by profit per produced item.
-function ns.Scan(adapter)
-  ns.pendingItemData = false
-  if CraftSellDB.autoExpand and adapter.ExpandAll then adapter.ExpandAll() end
-
-  local recipes = adapter.GetRecipes()
-
-  -- Index: which learned recipe produces which item, and which items are
-  -- used as reagents (-> intermediate products like cured hides).
-  local byOutput, usedAsReagent = {}, {}
+-- Cheapest way to get one unit of a reagent: buy it (vendor/AH) or craft it
+-- yourself with one of the given (learned) recipes – recursive, cycle-safe.
+-- Also used by Learn.lua to price recipes that are not learned yet.
+function ns.NewCoster(recipes)
+  local byOutput = {}
   for _, rec in ipairs(recipes) do
     rec.outputID = P.ItemIDFromLink(rec.output)
     if rec.outputID then
@@ -317,12 +338,9 @@ function ns.Scan(adapter)
     end
     for _, r in ipairs(rec.reagents) do
       r.itemID = P.ItemIDFromLink(r.item)
-      if r.itemID then usedAsReagent[r.itemID] = true end
     end
   end
 
-  -- Cheapest way to get one unit of a reagent: buy it (vendor/AH) or craft
-  -- it yourself with another learned recipe (recursive, cycle-safe).
   local memo = {}
   local RecipeCost
   local function ReagentUnit(itemID, visiting)
@@ -352,18 +370,14 @@ function ns.Scan(adapter)
     return cost, unknown
   end
 
-  CraftSellDB.reagentIDs = CraftSellDB.reagentIDs or {}
-  CraftSellDB.craftedIDs = CraftSellDB.craftedIDs or {}
-  CraftSellDB.recipes = CraftSellDB.recipes or {}
-
-  local results = {}
-  for _, rec in ipairs(recipes) do
-    local visiting = { [rec] = true }
+  -- Prices a reagent list in place (unit, src, via, market, name) and
+  -- returns the total cost and whether a price is missing.
+  local function PriceReagents(reagents, visiting)
     local cost, unknown = 0, false
-    for _, r in ipairs(rec.reagents) do
+    for _, r in ipairs(reagents) do
+      r.itemID = r.itemID or P.ItemIDFromLink(r.item)
       if r.itemID then
         r.unit, r.src, r.via, r.market, r.marketSrc = ReagentUnit(r.itemID, visiting)
-        CraftSellDB.reagentIDs[r.itemID] = true
       end
       if r.unit then
         cost = cost + r.unit * r.count
@@ -373,6 +387,55 @@ function ns.Scan(adapter)
       if not r.name and r.itemID and C_Item and C_Item.GetItemNameByID then
         r.name = C_Item.GetItemNameByID(r.itemID)
       end
+    end
+    return cost, unknown
+  end
+
+  return { PriceReagents = PriceReagents }
+end
+
+-- Rank: complete prices first, then by profit per item (desc).
+function ns.SortByProfit(results)
+  local function tier(e)
+    if e.profitItem and not e.unknownCost then return 0 end
+    if e.profitItem then return 1 end
+    return 2
+  end
+  table.sort(results, function(a, b)
+    local ta, tb = tier(a), tier(b)
+    if ta ~= tb then return ta < tb end
+    local pa, pb = a.profitItem or -math.huge, b.profitItem or -math.huge
+    if pa ~= pb then return pa > pb end
+    return (a.name or "") < (b.name or "")
+  end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Price every recipe and rank by profit per produced item.
+function ns.Scan(adapter)
+  ns.pendingItemData = false
+  if CraftSellDB.autoExpand and adapter.ExpandAll then adapter.ExpandAll() end
+
+  local recipes = adapter.GetRecipes()
+  local coster = ns.NewCoster(recipes)
+
+  -- Items used as reagents -> intermediate products like cured hides.
+  local usedAsReagent = {}
+  for _, rec in ipairs(recipes) do
+    for _, r in ipairs(rec.reagents) do
+      if r.itemID then usedAsReagent[r.itemID] = true end
+    end
+  end
+
+  CraftSellDB.reagentIDs = CraftSellDB.reagentIDs or {}
+  CraftSellDB.craftedIDs = CraftSellDB.craftedIDs or {}
+  CraftSellDB.recipes = CraftSellDB.recipes or {}
+
+  local results = {}
+  for _, rec in ipairs(recipes) do
+    local cost, unknown = coster.PriceReagents(rec.reagents, { [rec] = true })
+    for _, r in ipairs(rec.reagents) do
+      if r.itemID then CraftSellDB.reagentIDs[r.itemID] = true end
     end
 
     rec.cost = cost
@@ -393,19 +456,7 @@ function ns.Scan(adapter)
     results[#results + 1] = rec
   end
 
-  -- Rank: complete prices first, then by profit per item (desc).
-  local function tier(e)
-    if e.profitItem and not e.unknownCost then return 0 end
-    if e.profitItem then return 1 end
-    return 2
-  end
-  table.sort(results, function(a, b)
-    local ta, tb = tier(a), tier(b)
-    if ta ~= tb then return ta < tb end
-    local pa, pb = a.profitItem or -math.huge, b.profitItem or -math.huge
-    if pa ~= pb then return pa > pb end
-    return (a.name or "") < (b.name or "")
-  end)
+  ns.SortByProfit(results)
   return results
 end
 
@@ -481,15 +532,28 @@ local MainAdapter = {
   DockFrame = function()
     local live = OpenProfessionAdapter()
     if live then return _G[live.frameName], live.anchor end
+    if ns.Learn.TrainerOpen() and ClassTrainerFrame and ClassTrainerFrame:IsShown() then
+      -- classic trainer frame has transparent margins like TradeSkillFrame
+      local modern = ClassTrainerFrame.NineSlice ~= nil
+      return ClassTrainerFrame, modern and { 0, -2, 0, 2 } or { -34, -12, -34, 72 }
+    end
+  end,
+  -- Profession shown: open profession window > open trainer > cached choice.
+  ProfessionName = function()
+    if OpenProfessionAdapter() then return CurrentProfessionName() end
+    if ns.Learn.TrainerOpen() then return ns.Learn.trainerProf end
+    return (SelectedProfession())
   end,
   Title = function()
     if OpenProfessionAdapter() then
       return "CraftSell – " .. (CurrentProfessionName() or "Beruf")
     end
+    if ns.Learn.TrainerOpen() then return "CraftSell – " .. ns.Learn.trainerProf end
     return CacheAdapter.Title()
   end,
   Count = function()
-    if OpenProfessionAdapter() then return 1 end   -- no switching while live
+    -- no switching while a profession or trainer window is open
+    if OpenProfessionAdapter() or ns.Learn.TrainerOpen() then return 1 end
     return CacheAdapter.Count()
   end,
   EmptyText = function()
@@ -497,7 +561,7 @@ local MainAdapter = {
     return CacheAdapter.EmptyText()
   end,
   Cycle = function(dir)
-    if not OpenProfessionAdapter() then CacheAdapter.Cycle(dir) end
+    if not (OpenProfessionAdapter() or ns.Learn.TrainerOpen()) then CacheAdapter.Cycle(dir) end
   end,
   GetRecipes = function()
     local live = OpenProfessionAdapter()
@@ -505,6 +569,8 @@ local MainAdapter = {
       if CraftSellDB.autoExpand and live.ExpandAll then live.ExpandAll() end
       return live.GetRecipes()
     end
+    -- at a trainer whose profession was never opened: nothing cached for it
+    if ns.Learn.TrainerOpen() and SelectedProfession() ~= ns.Learn.trainerProf then return {} end
     return CacheAdapter.GetRecipes()
   end,
   Select = function(recipeID)
@@ -565,6 +631,56 @@ local function OnProfessionHide()
   openedByProfession = false
 end
 
+-- Profession trainer opened: show what is worth learning there.
+local modeBeforeTrainer
+local function OnTrainerShow(prof)
+  if OpenProfessionAdapter() then
+    ns.ScheduleRefresh(0.05)
+    return
+  end
+  local char = ns.Ledger.CharKey()
+  local _, data = CachedProfessions()
+  if data[prof] then
+    CraftSellDB.cacheSelected = CraftSellDB.cacheSelected or {}
+    CraftSellDB.cacheSelected[char] = prof
+  end
+  local panel = GetPanel()
+  if not panel then return end
+  if modeBeforeTrainer == nil then modeBeforeTrainer = CraftSellDB.learnMode or false end
+  CraftSellDB.learnMode = true
+  if not panel:IsShown() and CraftSellDB.autoOpen ~= false then
+    openedByProfession = true
+    panel:Show()
+    CraftSellDB.standaloneShown = false
+  end
+  panel.anchoredExtra = nil
+  ns.ScheduleRefresh(0.05)
+end
+
+local function OnTrainerHide()
+  ns.Learn.trainerProf = nil
+  if modeBeforeTrainer ~= nil then
+    CraftSellDB.learnMode = modeBeforeTrainer
+    modeBeforeTrainer = nil
+  end
+  if OpenProfessionAdapter() then return end
+  if mainPanel and mainPanel:IsShown() then
+    if openedByProfession then
+      mainPanel:Hide()
+    else
+      mainPanel.anchoredExtra = nil
+      ns.ScheduleRefresh(0.05)
+    end
+  end
+  openedByProfession = false
+end
+
+-- The tab buttons in the panel: the user's choice outlives the trainer visit.
+function ns.SetLearnMode(on)
+  CraftSellDB.learnMode = on and true or false
+  modeBeforeTrainer = nil
+end
+
 -- Hook the profession frames as soon as they exist.
 local hooked = {}
 local function TryHookFrames()
@@ -588,6 +704,7 @@ for _, e in ipairs({
   "CRAFT_SHOW", "CRAFT_UPDATE",
   "BAG_UPDATE_DELAYED", "GET_ITEM_INFO_RECEIVED",
   "MERCHANT_SHOW", "MERCHANT_UPDATE",
+  "TRAINER_SHOW", "TRAINER_UPDATE", "TRAINER_CLOSED",
   -- auction house activity -> prices may have changed
   "AUCTION_HOUSE_CLOSED", "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED",
   "COMMODITY_SEARCH_RESULTS_UPDATED", "ITEM_SEARCH_RESULTS_UPDATED",
@@ -620,6 +737,20 @@ ev:SetScript("OnEvent", function(_, event, arg1)
   elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
     InitDB()
     pcall(P.ScanMerchant)
+  elseif event == "TRAINER_SHOW" then
+    InitDB()
+    -- the trainer frame (load on demand) may be created in this same event
+    C_Timer.After(0, function()
+      local ok, prof = pcall(ns.Learn.ReadTrainer, true)
+      if ok and prof then OnTrainerShow(prof) end
+    end)
+  elseif event == "TRAINER_UPDATE" then
+    if ns.Learn.trainerProf then
+      pcall(ns.Learn.ReadTrainer, false)
+      ns.ScheduleRefresh(0.3)
+    end
+  elseif event == "TRAINER_CLOSED" then
+    if ns.Learn.trainerProf then OnTrainerHide() end
   elseif event:find("^AUCTION") or event:find("SEARCH_RESULTS") or event:find("^REPLICATE") then
     -- give Auctionator/Auctioneer a moment to store the new prices first
     ns.ScheduleRefresh(2)
@@ -670,6 +801,19 @@ SlashCmdList.CRAFTSELL = function(msg)
   end
   if msg == "" or msg == "fenster" then
     ns.ToggleStandalone()
+    return
+  end
+  if msg == "lernen" or msg == "lehrer" then
+    -- show the "learnable at the trainer" list (toggles back if already shown)
+    local panel = GetPanel()
+    if not panel then return end
+    if panel:IsShown() and CraftSellDB.learnMode then
+      ns.SetLearnMode(false)
+    else
+      ns.SetLearnMode(true)
+      if not panel:IsShown() then ns.ToggleStandalone(true) end
+    end
+    ns.ScheduleRefresh(0)
     return
   end
   if msg == "auto" then
@@ -723,7 +867,7 @@ SlashCmdList.CRAFTSELL = function(msg)
       Report("Fenster: sichtbar=" .. tostring(mainPanel:IsVisible()) .. ", Einträge=" .. #(mainPanel.list or {}))
     end
   else
-    Report("Befehle: /cs (Fenster), /cs auto, /cs bilanz, /cs verkaufen, /cs behalten [Item], "
+    Report("Befehle: /cs (Fenster), /cs lernen (Lehrer-Rezepte), /cs auto, /cs bilanz, /cs verkaufen, /cs behalten [Item], "
       .. "/cs transparenz 0-100, /cs dock, /cs fenster reset, /cs minimap, /cs reset")
   end
 end

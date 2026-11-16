@@ -15,7 +15,9 @@ local function Colorize(entry)
   return name
 end
 
-local ARROW_UP   = "|TInterface\\Buttons\\UI-MicroStream-Green:12:12|t"
+-- The MicroStream textures all point down; the green one is flipped
+-- vertically (top/bottom texcoords swapped) so "profit rose" points up.
+local ARROW_UP   = "|TInterface\\Buttons\\UI-MicroStream-Green:12:12:0:0:32:32:0:32:32:0|t"
 local ARROW_DOWN = "|TInterface\\Buttons\\UI-MicroStream-Red:12:12|t"
 local TREND_SECONDS = 600   -- show arrows for 10 minutes after a change
 
@@ -67,6 +69,27 @@ local function DetailText(e)
     .. own .. inter
 end
 
+-- Second line of a learnable recipe: trainer cost, skill, gain vs. best known.
+local function LearnDetailText(e)
+  local parts = { "|cffaaaaaaLernen:|r " .. (e.fee and Money(e.fee) or "|cff888888?|r") }
+  if e.skill then
+    parts[#parts + 1] = "|cffaaaaaaSkill|r " .. (e.canLearn and e.skill or ("|cffff6060" .. e.skill .. "|r"))
+  end
+  if e.noReagents then
+    parts[#parts + 1] = "|cffff8000Materialien unbekannt|r"
+  elseif e.gain then
+    parts[#parts + 1] = "|cffaaaaaavs. bestes:|r " .. (e.gain > 0 and "|cff40ff40+|r" or "") .. Money(e.gain)
+  end
+  if e.payback then parts[#parts + 1] = "|cffaaaaaarein nach|r " .. e.payback .. "x" end
+  return table.concat(parts, "   ")
+end
+
+local function LearnName(e)
+  local name = e.canLearn and (e.name or "?") or ("|cff9d9d9d" .. (e.name or "?") .. "|r")
+  if e.better then name = name .. " |cff40ff40(lohnt)|r" end
+  return name
+end
+
 local function ShowTooltip(owner, e)
   GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
   if type(e.output) == "number" then
@@ -75,7 +98,17 @@ local function ShowTooltip(owner, e)
     GameTooltip:SetHyperlink(e.output)
   end
   GameTooltip:AddLine(" ")
-  GameTooltip:AddLine("|cffffd200CraftSell – Händlerverkauf|r")
+  if e.learn then
+    GameTooltip:AddLine("|cffffd200CraftSell – beim Lehrer lernbar|r")
+    GameTooltip:AddDoubleLine("Lernkosten", e.fee and Money(e.fee) or "unbekannt", 1, 1, 1)
+    if e.skill then
+      local you = e.playerSkill and ("  (du: " .. e.playerSkill .. ")") or ""
+      GameTooltip:AddDoubleLine("Benötigte Fertigkeit", e.skill .. you,
+        1, 1, 1, e.canLearn and 0.3 or 1, e.canLearn and 1 or 0.3, 0.3)
+    end
+  else
+    GameTooltip:AddLine("|cffffd200CraftSell – Händlerverkauf|r")
+  end
   if e.sellUnit then
     GameTooltip:AddDoubleLine("Händlerpreis pro Stück", Money(e.sellUnit), 1, 1, 1)
   else
@@ -115,11 +148,41 @@ local function ShowTooltip(owner, e)
         Money(e.profitCraft * e.numAvailable), 1, 1, 1)
     end
   end
-  if e.unknownCost then
+  if e.learn then
+    local best = e.bestName and ('"' .. e.bestName .. '"') or "dein bestes Rezept"
+    if e.gain then
+      GameTooltip:AddDoubleLine("Mehr pro Stück als " .. best, Money(e.gain),
+        1, 1, 1, e.gain > 0 and 0.3 or 1, e.gain > 0 and 1 or 0.3, 0.3)
+    end
+    if e.payback then
+      GameTooltip:AddDoubleLine("Lernkosten wieder drin nach", e.payback .. " Herstellungen", 1, 1, 1, 1, 1, 1)
+    elseif e.profitCraft and e.profitCraft <= 0 then
+      GameTooltip:AddLine("Kein Gewinn beim Händler – lernen lohnt sich dafür nicht.", 1, 0.3, 0.3, true)
+    end
+  end
+  if e.noReagents then
+    GameTooltip:AddLine("Materialien unbekannt: öffne einmal das Berufsfenster oder installiere Crafter's Journal.", 1, 0.5, 0, true)
+  elseif e.unknownCost then
     GameTooltip:AddLine("* Für mind. ein Material fehlt ein Preis – Gewinn ist zu hoch angesetzt. Einmal im AH scannen!", 1, 0.5, 0, true)
   end
-  GameTooltip:AddLine("Klick: Rezept im Berufsfenster öffnen", 0.5, 0.8, 1)
+  if e.learn then
+    if e.source then GameTooltip:AddLine("Quelle: " .. e.source, 0.6, 0.6, 0.6) end
+    if ns.Learn.TrainerOpen() then
+      GameTooltip:AddLine("Klick: beim Lehrer auswählen", 0.5, 0.8, 1)
+    end
+  else
+    GameTooltip:AddLine("Klick: Rezept im Berufsfenster öffnen", 0.5, 0.8, 1)
+  end
   GameTooltip:Show()
+end
+
+local function OnEntryClick(adapter, e)
+  if not e then return end
+  if e.learn then
+    ns.Learn.SelectAtTrainer(e.name)
+  else
+    adapter.Select(e.id)
+  end
 end
 
 local function MakeCheck(panel, label, key, x, y)
@@ -128,10 +191,16 @@ local function MakeCheck(panel, label, key, x, y)
   cb:SetPoint("TOPLEFT", x, y)
   local fs = cb:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   fs:SetPoint("LEFT", cb, "RIGHT", 2, 1)
-  fs:SetText(label)
-  cb:SetChecked(CraftSellDB[key])
+  cb.label = fs
+  -- the same box can switch the setting it stands for (learn mode)
+  function cb:SetKey(newKey, newLabel)
+    self.key = newKey
+    self.label:SetText(newLabel)
+    self:SetChecked(CraftSellDB[newKey])
+  end
+  cb:SetKey(key, label)
   cb:SetScript("OnClick", function(self)
-    CraftSellDB[key] = self:GetChecked() and true or false
+    CraftSellDB[self.key] = self:GetChecked() and true or false
     ns.ScheduleRefresh(0)
   end)
   return cb
@@ -176,6 +245,9 @@ function ns.CreatePanel(parent, adapter)
   -- Sit to the right of anything that sticks out of the profession window
   -- (e.g. the profession tabs on its right edge).
   function panel:Reanchor()
+    -- Never while the user drags or resizes: the periodic refresh would put
+    -- the window back to its old saved position (it "jumps").
+    if self.moving then return end
     local pos = cfg.pos
     if pos then
       -- user moved the window: restore saved position (stored in screen pixels)
@@ -264,16 +336,22 @@ function ns.CreatePanel(parent, adapter)
     panel:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", l, t)
   end
   local function SaveGeometry()
+    if not panel.moving then return end
     panel:StopMovingOrSizing()
+    panel.moving = nil
     if panel.SetUserPlaced then panel:SetUserPlaced(false) end
     local es = panel:GetEffectiveScale()
-    cfg.pos = { x = panel:GetLeft() * es, y = panel:GetTop() * es, h = panel:GetHeight() * es }
-    cfg.width = panel:GetWidth()
+    local l, t = panel:GetLeft(), panel:GetTop()
+    if l and t then
+      cfg.pos = { x = l * es, y = t * es, h = panel:GetHeight() * es }
+      cfg.width = panel:GetWidth()
+    end
     panel:Reanchor()
     panel:UpdateRows()
   end
   drag:SetScript("OnDragStart", function()
     Detach()
+    panel.moving = true
     panel:StartMoving()
   end)
   drag:SetScript("OnDragStop", SaveGeometry)
@@ -290,9 +368,9 @@ function ns.CreatePanel(parent, adapter)
   -- Resize grip (bottom right) ------------------------------------------------
   panel:SetResizable(true)
   if panel.SetResizeBounds then
-    panel:SetResizeBounds(300, 320, 900, 1400)
+    panel:SetResizeBounds(300, 344, 900, 1400)
   else
-    if panel.SetMinResize then panel:SetMinResize(300, 320) end
+    if panel.SetMinResize then panel:SetMinResize(300, 344) end
     if panel.SetMaxResize then panel:SetMaxResize(900, 1400) end
   end
   local grip = CreateFrame("Button", nil, panel)
@@ -305,6 +383,7 @@ function ns.CreatePanel(parent, adapter)
   grip:SetScript("OnMouseDown", function(_, button)
     if button ~= "LeftButton" then return end
     Detach()
+    panel.moving = true
     panel:StartSizing("BOTTOMRIGHT")
   end)
   grip:SetScript("OnMouseUp", SaveGeometry)
@@ -370,10 +449,37 @@ function ns.CreatePanel(parent, adapter)
     tinsert(UISpecialFrames, panel:GetName())
   end
 
+  -- Tabs: own recipes / recipes learnable at the trainer -------------------------
+  local function MakeTab(text, learn)
+    local b = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    b:SetHeight(20)
+    b:SetText(text)
+    b:SetScript("OnClick", function()
+      ns.SetLearnMode(learn)
+      FauxScrollFrame_SetOffset(panel.scroll, 0)
+      panel:Refresh()
+    end)
+    return b
+  end
+  local tabMine = MakeTab("Meine Rezepte", false)
+  tabMine:SetPoint("TOPLEFT", 10, -34)
+  tabMine:SetPoint("TOPRIGHT", panel, "TOP", -2, -34)
+  local tabLearn = MakeTab("Beim Lehrer lernbar", true)
+  tabLearn:SetPoint("TOPLEFT", panel, "TOP", 2, -34)
+  tabLearn:SetPoint("TOPRIGHT", -10, -34)
+  tabLearn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:AddLine("Rezepte vom Lehrer, die du noch nicht kannst")
+    GameTooltip:AddLine("Bewertet wie deine Rezepte (Händlerpreis minus Material) und verglichen mit deinem besten gelernten Rezept.", 1, 1, 1, true)
+    GameTooltip:AddLine("Daten: Lehrer einmal besuchen (Kosten, Skill), Materialien aus dem Berufsfenster oder Crafter's Journal.", 0.7, 0.7, 0.7, true)
+    GameTooltip:Show()
+  end)
+  tabLearn:SetScript("OnLeave", GameTooltip_Hide)
+
   -- Best recipe highlight -----------------------------------------------------
   local best = CreateFrame("Button", nil, panel, BACKDROP)
-  best:SetPoint("TOPLEFT", 10, -36)
-  best:SetPoint("TOPRIGHT", -10, -36)
+  best:SetPoint("TOPLEFT", 10, -60)
+  best:SetPoint("TOPRIGHT", -10, -60)
   best:SetHeight(62)
   panel.bestBg = AddBackground(best, 0.25, 0.18, 0.02, 0.85, 3)
   AddBorder(best, 1, 0.82, 0, 1)
@@ -400,13 +506,20 @@ function ns.CreatePanel(parent, adapter)
   best.detail:SetWordWrap(false)
   best:SetScript("OnEnter", function(self) if self.entry then ShowTooltip(self, self.entry) end end)
   best:SetScript("OnLeave", GameTooltip_Hide)
-  best:SetScript("OnClick", function(self) if self.entry then adapter.Select(self.entry.id) end end)
+  best:SetScript("OnClick", function(self) OnEntryClick(adapter, self.entry) end)
   panel.best = best
 
   -- Filters -------------------------------------------------------------------
-  local y = -104
-  MakeCheck(panel, "Nur herstellbar", "onlyCraftable", 10, y)
-  MakeCheck(panel, "Nur mit Gewinn", "onlyProfit", 130, y)
+  local y = -128
+  local check1 = MakeCheck(panel, "Nur herstellbar", "onlyCraftable", 10, y)
+  local check2 = MakeCheck(panel, "Nur mit Gewinn", "onlyProfit", 130, y)
+  check2:SetScript("OnEnter", function(self)
+    if self.key ~= "onlyBetter" then return end
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:AddLine("Nur Rezepte, die mehr Gewinn pro Stück bringen als dein bestes gelerntes Rezept.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  check2:SetScript("OnLeave", GameTooltip_Hide)
   if adapter.ExpandAll then
     -- Only classic windows hide recipes in collapsed categories.
     local cb = MakeCheck(panel, "Aufklappen", "autoExpand", 245, y)
@@ -421,20 +534,20 @@ function ns.CreatePanel(parent, adapter)
 
   -- Column headers ------------------------------------------------------------
   local hName = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  hName:SetPoint("TOPLEFT", 14, -132)
+  hName:SetPoint("TOPLEFT", 14, -156)
   hName:SetText("#   Rezept")
   local hProfit = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  hProfit:SetPoint("TOPRIGHT", -34, -132)
+  hProfit:SetPoint("TOPRIGHT", -34, -156)
   hProfit:SetText("Gewinn / Stück")
   local sep = panel:CreateTexture(nil, "ARTWORK")
   sep:SetColorTexture(0.6, 0.5, 0.3, 0.6)
   sep:SetHeight(1)
-  sep:SetPoint("TOPLEFT", 10, -146)
-  sep:SetPoint("TOPRIGHT", -10, -146)
+  sep:SetPoint("TOPLEFT", 10, -170)
+  sep:SetPoint("TOPRIGHT", -10, -170)
 
   -- List ----------------------------------------------------------------------
   local scroll = CreateFrame("ScrollFrame", "CraftSellScroll_" .. adapter.key, panel, "FauxScrollFrameTemplate")
-  scroll:SetPoint("TOPLEFT", 10, -150)
+  scroll:SetPoint("TOPLEFT", 10, -174)
   scroll:SetPoint("BOTTOMRIGHT", -30, 52)
   scroll:SetScript("OnVerticalScroll", function(self, offset)
     FauxScrollFrame_OnVerticalScroll(self, offset, ROW_H, function() panel:UpdateRows() end)
@@ -474,7 +587,7 @@ function ns.CreatePanel(parent, adapter)
 
     row:SetScript("OnEnter", function(self) if self.entry then ShowTooltip(self, self.entry) end end)
     row:SetScript("OnLeave", GameTooltip_Hide)
-    row:SetScript("OnClick", function(self) if self.entry then adapter.Select(self.entry.id) end end)
+    row:SetScript("OnClick", function(self) OnEntryClick(adapter, self.entry) end)
     row:Hide()
     panel.rows[i] = row
   end
@@ -519,14 +632,47 @@ function ns.CreatePanel(parent, adapter)
       self.prevButton:SetEnabled(multiple)
       self.nextButton:SetEnabled(multiple)
     end
+    local learn = CraftSellDB.learnMode and true or false
+    self.learn = learn
+    if learn then
+      tabLearn:LockHighlight()
+      tabMine:UnlockHighlight()
+      check1:SetKey("onlyLearnable", "Nur jetzt lernbar")
+      check2:SetKey("onlyBetter", "Nur lohnend")
+      best.label:SetText("Bestes lernbares Rezept")
+    else
+      tabMine:LockHighlight()
+      tabLearn:UnlockHighlight()
+      check1:SetKey("onlyCraftable", "Nur herstellbar")
+      check2:SetKey("onlyProfit", "Nur mit Gewinn")
+      best.label:SetText("Platz 1 – bester Gewinn pro Stück")
+    end
+
     local all = ns.Scan(self.adapter)
-    local list = {}
-    for _, e in ipairs(all) do
-      UpdateTrend(adapter.key .. ":" .. tostring(e.id) .. ":" .. tostring(e.output), e)
-      local ok = true
-      if CraftSellDB.onlyCraftable and (e.numAvailable or 0) <= 0 then ok = false end
-      if CraftSellDB.onlyProfit and not (e.profitItem and e.profitItem > 0) then ok = false end
-      if ok then list[#list + 1] = e end
+    local list, sources, nBetter = {}, nil, 0
+    if learn then
+      local top
+      for _, e in ipairs(all) do
+        if e.profitItem and not e.unknownCost then top = e break end
+      end
+      local prof = adapter.ProfessionName and adapter.ProfessionName()
+      local learnable
+      learnable, sources = ns.Learn.Scan(prof, all, top)
+      for _, e in ipairs(learnable) do
+        if e.better then nBetter = nBetter + 1 end
+        local ok = true
+        if CraftSellDB.onlyLearnable and not e.canLearn then ok = false end
+        if CraftSellDB.onlyBetter and not e.better then ok = false end
+        if ok then list[#list + 1] = e end
+      end
+    else
+      for _, e in ipairs(all) do
+        UpdateTrend(adapter.key .. ":" .. tostring(e.id) .. ":" .. tostring(e.output), e)
+        local ok = true
+        if CraftSellDB.onlyCraftable and (e.numAvailable or 0) <= 0 then ok = false end
+        if CraftSellDB.onlyProfit and not (e.profitItem and e.profitItem > 0) then ok = false end
+        if ok then list[#list + 1] = e end
+      end
     end
     self.list = list
 
@@ -534,19 +680,30 @@ function ns.CreatePanel(parent, adapter)
     if top and top.profitItem then
       best.entry = top
       best.icon:SetTexture(top.icon)
-      best.name:SetText(Colorize(top))
+      best.name:SetText(learn and LearnName(top) or Colorize(top))
       best.profit:SetText(ProfitText(top))
-      best.detail:SetText(DetailText(top))
+      best.detail:SetText(learn and LearnDetailText(top) or DetailText(top))
     else
+      local empty = adapter.EmptyText and adapter.EmptyText() or "Kein passendes Rezept"
+      if learn and sources and not (sources.trainer or sources.cj) then
+        empty = "Besuche einmal einen Lehrer dieses Berufs"
+      end
       best.entry = nil
       best.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
-      best.name:SetText("|cff888888" .. (adapter.EmptyText and adapter.EmptyText() or "Kein passendes Rezept") .. "|r")
+      best.name:SetText("|cff888888" .. empty .. "|r")
       best.profit:SetText("")
       best.detail:SetText("")
     end
 
     if not P.HasPriceAddon() then
       self.status:SetText("|cffff8000Auctionator/Auctioneer nicht geladen – nur Händlerpreise.|r")
+    elseif learn then
+      local hint = ""
+      if sources and not sources.learned then
+        hint = "  ·  |cffff8000Beruf einmal öffnen!|r"
+      end
+      self.status:SetText(string.format("%d lernbar  ·  |cff40ff40%d lohnend|r%s  ·  %s",
+        #list, nBetter, hint, date("%H:%M:%S")))
     else
       self.status:SetText(string.format("%d Rezepte  ·  * = Preis fehlt  ·  aktualisiert %s",
         #list, date("%H:%M:%S")))
@@ -567,11 +724,16 @@ function ns.CreatePanel(parent, adapter)
         local rank = offset + i
         row.rank:SetText(rank == 1 and "|cffffd2001|r" or tostring(rank))
         row.icon:SetTexture(e.icon)
-        local name = Colorize(e)
-        if (e.numAvailable or 0) > 0 then name = name .. " |cff80ff80[" .. e.numAvailable .. "]|r" end
-        row.name:SetText(name)
+        if e.learn then
+          row.name:SetText(LearnName(e))
+          row.detail:SetText(LearnDetailText(e))
+        else
+          local name = Colorize(e)
+          if (e.numAvailable or 0) > 0 then name = name .. " |cff80ff80[" .. e.numAvailable .. "]|r" end
+          row.name:SetText(name)
+          row.detail:SetText(DetailText(e))
+        end
         row.profit:SetText(ProfitText(e))
-        row.detail:SetText(DetailText(e))
         row:Show()
       else
         row:Hide()
@@ -593,6 +755,8 @@ function ns.CreatePanel(parent, adapter)
       self.ticker = nil
     end
   end)
+  -- closed while dragging (ESC): finish the move, or the flag would stick
+  panel:HookScript("OnHide", SaveGeometry)
   if panel:IsShown() and C_Timer.NewTicker then
     panel.ticker = C_Timer.NewTicker(10, function() ns.ScheduleRefresh(0) end)
   end
