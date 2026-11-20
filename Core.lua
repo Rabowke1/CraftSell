@@ -345,6 +345,11 @@ function ns.NewCoster(recipes)
   local RecipeCost
   local function ReagentUnit(itemID, visiting)
     local market, marketSrc = P.GetReagentPrice(itemID)
+    if CraftSellDB.usePaid then
+      -- rate with what was really paid (auction invoices from the mailbox)
+      local paid = ns.Mail.PaidUnit(itemID)
+      if paid then return paid, ns.Mail.SRC, nil, market, marketSrc end
+    end
     local best, src, via = market, marketSrc, nil
     for _, sub in ipairs(byOutput[itemID] or {}) do
       if not visiting[sub] then
@@ -378,6 +383,7 @@ function ns.NewCoster(recipes)
       r.itemID = r.itemID or P.ItemIDFromLink(r.item)
       if r.itemID then
         r.unit, r.src, r.via, r.market, r.marketSrc = ReagentUnit(r.itemID, visiting)
+        r.paid = ns.Mail.PaidUnit(r.itemID)
       end
       if r.unit then
         cost = cost + r.unit * r.count
@@ -835,6 +841,25 @@ SlashCmdList.CRAFTSELL = function(msg)
     end
     return
   end
+  local word, rest = msg:match("^(%S+)%s*(.-)$")
+  -- ("Käufe": string.lower does not touch the UTF-8 umlaut)
+  if word == "käufe" or word == "Käufe" or word == "kaeufe" or word == "kauf" or word == "einkauf" or word == "post" then
+    if rest == "reset" then
+      ns.Mail.Reset()
+      Report("erfasste Käufe aus dem Postfach gelöscht.")
+    elseif rest == "an" or rest == "aus" or rest == "preis" then
+      if rest == "preis" then
+        CraftSellDB.usePaid = not CraftSellDB.usePaid
+      else
+        CraftSellDB.usePaid = (rest == "an")
+      end
+      Report("Rezepte bewerten mit: " .. (CraftSellDB.usePaid and "deinen Kaufpreisen (Postfach)" or "aktuellen Marktpreisen") .. ".")
+      ns.ScheduleRefresh(0)
+    else
+      ns.Mail.PrintSummary()
+    end
+    return
+  end
   if msg == "reset" then
     CraftSellDB.vendorBuy = {}
     Report("gespeicherte Händler-Einkaufspreise gelöscht.")
@@ -867,7 +892,7 @@ SlashCmdList.CRAFTSELL = function(msg)
       Report("Fenster: sichtbar=" .. tostring(mainPanel:IsVisible()) .. ", Einträge=" .. #(mainPanel.list or {}))
     end
   else
-    Report("Befehle: /cs (Fenster), /cs lernen (Lehrer-Rezepte), /cs auto, /cs bilanz, /cs verkaufen, /cs behalten [Item], "
+    Report("Befehle: /cs (Fenster), /cs lernen (Lehrer-Rezepte), /cs auto, /cs bilanz, /cs käufe [an|aus|reset], /cs verkaufen, /cs behalten [Item], "
       .. "/cs transparenz 0-100, /cs dock, /cs fenster reset, /cs minimap, /cs reset")
   end
 end

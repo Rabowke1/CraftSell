@@ -15,9 +15,7 @@ local function Colorize(entry)
   return name
 end
 
--- The MicroStream textures all point down; the green one is flipped
--- vertically (top/bottom texcoords swapped) so "profit rose" points up.
-local ARROW_UP   = "|TInterface\\Buttons\\UI-MicroStream-Green:12:12:0:0:32:32:0:32:32:0|t"
+local ARROW_UP   = "|TInterface\\Buttons\\UI-MicroStream-Green:12:12|t"
 local ARROW_DOWN = "|TInterface\\Buttons\\UI-MicroStream-Red:12:12|t"
 local TREND_SECONDS = 600   -- show arrows for 10 minutes after a change
 
@@ -117,7 +115,8 @@ local function ShowTooltip(owner, e)
   if e.made and e.made ~= 1 then
     GameTooltip:AddDoubleLine("Stück pro Herstellung", string.format("%g", e.made), 1, 1, 1, 1, 1, 1)
   end
-  GameTooltip:AddLine("Materialkosten:", 1, 1, 1)
+  GameTooltip:AddLine(CraftSellDB.usePaid and "Materialkosten (deine Kaufpreise):" or "Materialkosten:", 1, 1, 1)
+  local altCost, hasPaid = 0, false
   for _, r in ipairs(e.reagents) do
     local right
     if r.unit then
@@ -126,6 +125,21 @@ local function ShowTooltip(owner, e)
       right = "|cffff8000kein Preis|r"
     end
     GameTooltip:AddDoubleLine("  " .. r.count .. "x " .. (r.name or "?"), right, 0.8, 0.8, 0.8)
+    if r.paid then
+      -- the other price basis: what you paid (mailbox) vs. current market
+      local isPaid = r.src == ns.Mail.SRC
+      local other = isPaid and r.market or r.paid
+      if other then
+        hasPaid = true
+        altCost = altCost + other * r.count
+        GameTooltip:AddDoubleLine(isPaid and "     aktueller Marktpreis" or "     von dir bezahlt (Postfach)",
+          Money(other * r.count), 0.6, 0.6, 0.6, 0.6, 0.6, 0.6)
+      else
+        altCost = altCost + (r.unit or 0) * r.count
+      end
+    else
+      altCost = altCost + (r.unit or 0) * r.count
+    end
     if r.via then
       -- cheaper to craft this reagent yourself
       GameTooltip:AddDoubleLine("     -> selbst herstellen: " .. (r.via.name or "?"),
@@ -143,6 +157,11 @@ local function ShowTooltip(owner, e)
         Money(e.oldProfit), e.trend == 1 and 0.3 or 1, e.trend == 1 and 1 or 0.3, 0.3)
     end
     GameTooltip:AddDoubleLine("Gewinn pro Herstellung", Money(e.profitCraft), 1, 1, 1)
+    if hasPaid and not e.unknownCost and e.sellUnit and e.made then
+      GameTooltip:AddDoubleLine(CraftSellDB.usePaid and "Gewinn pro Gegenstand zu Marktpreisen"
+        or "Gewinn pro Gegenstand mit deinen Kaufpreisen",
+        Money(e.sellUnit - altCost / e.made), 0.5, 0.8, 1, 1, 1, 1)
+    end
     if (e.numAvailable or 0) > 0 then
       GameTooltip:AddDoubleLine("Jetzt herstellbar: " .. e.numAvailable .. "x  → gesamt",
         Money(e.profitCraft * e.numAvailable), 1, 1, 1)
@@ -530,6 +549,17 @@ function ns.CreatePanel(parent, adapter)
       GameTooltip:Show()
     end)
     cb:SetScript("OnLeave", GameTooltip_Hide)
+  else
+    local cb = MakeCheck(panel, "Kaufpreis", "usePaid", 245, y)
+    cb:SetScript("OnEnter", function(self)
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      GameTooltip:AddLine("Mit deinen Kaufpreisen rechnen")
+      GameTooltip:AddLine("Materialien, die du im Auktionshaus gekauft hast, zählen mit dem Preis, den du wirklich bezahlt hast (Durchschnitt deines aktuellen Bestands) – statt mit dem aktuellen Marktpreis.", 1, 1, 1, true)
+      GameTooltip:AddLine("Die Käufe werden aus den \"Auktion gewonnen\"-Briefen gelesen, sobald du das Postfach öffnest. Liste: /cs käufe", 0.7, 0.7, 0.7, true)
+      GameTooltip:Show()
+    end)
+    cb:SetScript("OnLeave", GameTooltip_Hide)
+    panel.paidCheck = cb
   end
 
   -- Column headers ------------------------------------------------------------
@@ -632,6 +662,7 @@ function ns.CreatePanel(parent, adapter)
       self.prevButton:SetEnabled(multiple)
       self.nextButton:SetEnabled(multiple)
     end
+    if self.paidCheck then self.paidCheck:SetChecked(CraftSellDB.usePaid) end
     local learn = CraftSellDB.learnMode and true or false
     self.learn = learn
     if learn then
@@ -667,7 +698,9 @@ function ns.CreatePanel(parent, adapter)
       end
     else
       for _, e in ipairs(all) do
-        UpdateTrend(adapter.key .. ":" .. tostring(e.id) .. ":" .. tostring(e.output), e)
+        -- own trend per price basis: switching "Kaufpreis" is not a price change
+        UpdateTrend(adapter.key .. ":" .. tostring(e.id) .. ":" .. tostring(e.output)
+          .. (CraftSellDB.usePaid and ":paid" or ""), e)
         local ok = true
         if CraftSellDB.onlyCraftable and (e.numAvailable or 0) <= 0 then ok = false end
         if CraftSellDB.onlyProfit and not (e.profitItem and e.profitItem > 0) then ok = false end
