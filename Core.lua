@@ -328,7 +328,8 @@ local CacheAdapter = {
 -- Cheapest way to get one unit of a reagent: buy it (vendor/AH) or craft it
 -- yourself with one of the given (learned) recipes – recursive, cycle-safe.
 -- Also used by Learn.lua to price recipes that are not learned yet.
-function ns.NewCoster(recipes)
+function ns.NewCoster(recipes, usePaid)
+  if usePaid == nil then usePaid = CraftSellDB.usePaid end
   local byOutput = {}
   for _, rec in ipairs(recipes) do
     rec.outputID = P.ItemIDFromLink(rec.output)
@@ -345,7 +346,7 @@ function ns.NewCoster(recipes)
   local RecipeCost
   local function ReagentUnit(itemID, visiting)
     local market, marketSrc = P.GetReagentPrice(itemID)
-    if CraftSellDB.usePaid then
+    if usePaid then
       -- rate with what was really paid (auction invoices from the mailbox)
       local paid = ns.Mail.PaidUnit(itemID)
       if paid then return paid, ns.Mail.SRC, nil, market, marketSrc end
@@ -418,12 +419,16 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Price every recipe and rank by profit per produced item.
-function ns.Scan(adapter)
+-- forcePaid = true: rate with the purchase prices whatever the "Kaufpreis"
+-- switch says (Bilanz page).
+function ns.Scan(adapter, forcePaid)
+  local usePaid = forcePaid
+  if usePaid == nil then usePaid = CraftSellDB.usePaid end
   ns.pendingItemData = false
   if CraftSellDB.autoExpand and adapter.ExpandAll then adapter.ExpandAll() end
 
   local recipes = adapter.GetRecipes()
-  local coster = ns.NewCoster(recipes)
+  local coster = ns.NewCoster(recipes, usePaid)
 
   -- Items used as reagents -> intermediate products like cured hides.
   local usedAsReagent = {}
@@ -445,12 +450,13 @@ function ns.Scan(adapter)
     end
 
     rec.cost = cost
+    rec.paidBasis = usePaid and true or false
     rec.unknownCost = unknown
     rec.isIntermediate = rec.outputID ~= nil and usedAsReagent[rec.outputID] == true
     if rec.outputID then CraftSellDB.craftedIDs[rec.outputID] = true end
     -- remember for the gold tracker (modern recipeID == spellID of the craft)
     -- (with the modern API recipe IDs are spell IDs – live and cached data)
-    if ModernAdapter.Available() and not unknown then
+    if ModernAdapter.Available() and not unknown and forcePaid == nil then
       CraftSellDB.recipes[rec.id] = { cost = cost, made = rec.made, inter = rec.isIntermediate or nil }
     end
     rec.sellUnit = P.GetVendorSellPrice(rec.output)
@@ -525,11 +531,66 @@ local function OpenProfessionAdapter()
   end
 end
 
+-- Professions of this character that have a recipe window: both primary
+-- slots and cooking. { { name = ..., line = skillLineID }, ... }
+local function CharProfessions()
+  local out = {}
+  if not (GetProfessions and GetProfessionInfo) then return out end
+  local slots = { GetProfessions() }
+  for _, i in ipairs({ 1, 2, 5 }) do
+    local index = slots[i]
+    if index then
+      local name, _, _, _, _, _, line = GetProfessionInfo(index)
+      if name and line then out[#out + 1] = { name = name, line = line } end
+    end
+  end
+  return out
+end
+
+-- Can the arrows switch the OPEN profession window to another profession?
+local function CanSwitchLive()
+  return C_TradeSkillUI and C_TradeSkillUI.OpenTradeSkill and OpenProfessionAdapter() ~= nil
+    and not ns.Learn.TrainerOpen()
+end
+
+-- The professions the arrows page through: count, index of the shown one and
+-- a function that shows number i.
+local function ProfPages()
+  if CanSwitchLive() then
+    local list, cur = CharProfessions(), CurrentProfessionName()
+    local idx
+    for i, p in ipairs(list) do
+      if p.name == cur then idx = i end
+    end
+    return #list, idx, function(i)
+      if list[i].name ~= cur then
+        -- called straight from the arrow click: open that profession
+        C_TradeSkillUI.OpenTradeSkill(list[i].line)
+        ns.ScheduleRefresh(0.2)
+      end
+    end
+  end
+  -- no switching at a trainer (or without a way to open another profession)
+  if OpenProfessionAdapter() or ns.Learn.TrainerOpen() then return 1, 1, function() end end
+  local sel, list = SelectedProfession()
+  local idx
+  for i, name in ipairs(list) do
+    if name == sel then idx = i end
+  end
+  return #list, idx, function(i)
+    CraftSellDB.cacheSelected = CraftSellDB.cacheSelected or {}
+    CraftSellDB.cacheSelected[ns.Ledger.CharKey()] = list[i]
+  end
+end
+
 -- ---------------------------------------------------------------------------
 -- ONE window for everything:
 --   profession window open  -> live data of that profession (and docks next
 --                              to it, unless the user placed it elsewhere)
+--                              arrows open the character's next profession
 --   no profession window    -> cached recipes, arrows switch profession
+--   behind the last profession the arrows show the "Bilanz" page
+--   (ns.balancePage): what the material in stock brings (Balance.lua)
 local MainAdapter = {
   key = "main",
   standalone = true,
@@ -557,17 +618,26 @@ local MainAdapter = {
     if ns.Learn.TrainerOpen() then return "CraftSell – " .. ns.Learn.trainerProf end
     return CacheAdapter.Title()
   end,
-  Count = function()
-    -- no switching while a profession or trainer window is open
-    if OpenProfessionAdapter() or ns.Learn.TrainerOpen() then return 1 end
-    return CacheAdapter.Count()
-  end,
+  -- the professions plus the Bilanz page: the arrows always lead somewhere
+  Count = function() return math.max((ProfPages()), 1) + 1 end,
   EmptyText = function()
     if OpenProfessionAdapter() then return "Kein passendes Rezept" end
     return CacheAdapter.EmptyText()
   end,
   Cycle = function(dir)
-    if not (OpenProfessionAdapter() or ns.Learn.TrainerOpen()) then CacheAdapter.Cycle(dir) end
+    local n, idx, show = ProfPages()
+    if ns.balancePage then
+      -- leaving the Bilanz page: on to the first / back to the last profession
+      ns.balancePage = false
+      if n > 0 then show(dir > 0 and 1 or n) end
+      return
+    end
+    local target = (idx or (dir > 0 and 0 or n + 1)) + dir
+    if target < 1 or target > n then
+      ns.balancePage = true
+    else
+      show(target)
+    end
   end,
   GetRecipes = function()
     local live = OpenProfessionAdapter()
@@ -612,6 +682,24 @@ function ns.ToggleStandalone(show)
   if show then ns.ScheduleRefresh(0) end
 end
 
+-- "/cs bilanz" and new purchases in the mailbox (auto): show the Bilanz page.
+function ns.ShowBalance(auto)
+  if auto and CraftSellDB.autoOpen == false and not (mainPanel and mainPanel:IsShown()) then return end
+  local panel = GetPanel()
+  if not panel then return end
+  ns.balancePage = true
+  if not panel:IsShown() then
+    if auto then
+      panel:Show()
+      -- opened automatically: do not reopen it on the next login
+      CraftSellDB.standaloneShown = false
+    else
+      ns.ToggleStandalone(true)
+    end
+  end
+  ns.ScheduleRefresh(0)
+end
+
 local function OnProfessionShow()
   if not OpenProfessionAdapter() then return end
   local panel = GetPanel()
@@ -654,6 +742,7 @@ local function OnTrainerShow(prof)
   if not panel then return end
   if modeBeforeTrainer == nil then modeBeforeTrainer = CraftSellDB.learnMode or false end
   CraftSellDB.learnMode = true
+  ns.balancePage = false
   if not panel:IsShown() and CraftSellDB.autoOpen ~= false then
     openedByProfession = true
     panel:Show()
@@ -863,7 +952,9 @@ SlashCmdList.CRAFTSELL = function(msg)
   if msg == "reset" then
     CraftSellDB.vendorBuy = {}
     Report("gespeicherte Händler-Einkaufspreise gelöscht.")
-  elseif msg == "bilanz" or msg == "gold" then
+  elseif msg == "bilanz" then
+    ns.ShowBalance()
+  elseif msg == "gold" then
     ns.Ledger.PrintSummary()
   elseif msg == "bilanz reset" then
     local d = ns.Ledger.Day()
@@ -892,7 +983,7 @@ SlashCmdList.CRAFTSELL = function(msg)
       Report("Fenster: sichtbar=" .. tostring(mainPanel:IsVisible()) .. ", Einträge=" .. #(mainPanel.list or {}))
     end
   else
-    Report("Befehle: /cs (Fenster), /cs lernen (Lehrer-Rezepte), /cs auto, /cs bilanz, /cs käufe [an|aus|reset], /cs verkaufen, /cs behalten [Item], "
+    Report("Befehle: /cs (Fenster), /cs lernen (Lehrer-Rezepte), /cs auto, /cs bilanz (Material-Bilanz), /cs gold (Tages-Tracker), /cs käufe [an|aus|reset], /cs verkaufen, /cs behalten [Item], "
       .. "/cs transparenz 0-100, /cs dock, /cs fenster reset, /cs minimap, /cs reset")
   end
 end

@@ -2,7 +2,7 @@
 ## Title: CraftSell
 ## Notes: Zeigt im Berufsfenster, welches Rezept beim HAENDLER den meisten Gewinn bringt (Materialpreise aus Auctionator/Auctioneer) und welche Lehrer-Rezepte sich zu lernen lohnen. Liest AH-Kaufpreise aus dem Postfach.
 ## Author: CraftSell
-## Version: 1.6.0
+## Version: 1.7.0
 ## SavedVariables: CraftSellDB
 ## OptionalDeps: Auctionator, Auc-Advanced, CraftersJournal
 ## IconTexture: Interface\Icons\INV_Misc_Coin_02
@@ -10,6 +10,7 @@
 Prices.lua
 Ledger.lua
 Mail.lua
+Balance.lua
 Learn.lua
 Seller.lua
 Navigate.lua

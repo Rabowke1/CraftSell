@@ -89,6 +89,22 @@ local function LearnName(e)
 end
 
 local function ShowTooltip(owner, e)
+  if e.balance then
+    -- Bilanz page: a planned recipe shows the recipe tooltip, a material its stock
+    if e.rec then
+      e = e.rec
+    elseif e.itemID then
+      GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+      GameTooltip:SetItemByID(e.itemID)
+      ns.Balance.MaterialTooltip(GameTooltip, e)
+      GameTooltip:Show()
+      return
+    else
+      return
+    end
+  end
+  local paidBasis = e.paidBasis
+  if paidBasis == nil then paidBasis = CraftSellDB.usePaid end
   GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
   if type(e.output) == "number" then
     GameTooltip:SetItemByID(e.output)
@@ -115,7 +131,7 @@ local function ShowTooltip(owner, e)
   if e.made and e.made ~= 1 then
     GameTooltip:AddDoubleLine("Stück pro Herstellung", string.format("%g", e.made), 1, 1, 1, 1, 1, 1)
   end
-  GameTooltip:AddLine(CraftSellDB.usePaid and "Materialkosten (deine Kaufpreise):" or "Materialkosten:", 1, 1, 1)
+  GameTooltip:AddLine(paidBasis and "Materialkosten (deine Kaufpreise):" or "Materialkosten:", 1, 1, 1)
   local altCost, hasPaid = 0, false
   for _, r in ipairs(e.reagents) do
     local right
@@ -158,7 +174,7 @@ local function ShowTooltip(owner, e)
     end
     GameTooltip:AddDoubleLine("Gewinn pro Herstellung", Money(e.profitCraft), 1, 1, 1)
     if hasPaid and not e.unknownCost and e.sellUnit and e.made then
-      GameTooltip:AddDoubleLine(CraftSellDB.usePaid and "Gewinn pro Gegenstand zu Marktpreisen"
+      GameTooltip:AddDoubleLine(paidBasis and "Gewinn pro Gegenstand zu Marktpreisen"
         or "Gewinn pro Gegenstand mit deinen Kaufpreisen",
         Money(e.sellUnit - altCost / e.made), 0.5, 0.8, 1, 1, 1, 1)
     end
@@ -197,6 +213,10 @@ end
 
 local function OnEntryClick(adapter, e)
   if not e then return end
+  if e.balance then
+    if e.rec then adapter.Select(e.rec.id) end
+    return
+  end
   if e.learn then
     ns.Learn.SelectAtTrainer(e.name)
   else
@@ -426,7 +446,7 @@ function ns.CreatePanel(parent, adapter)
     GameTooltip:AddLine("Linke Maustaste ziehen: Fenster verschieben", 1, 1, 1)
     if adapter.standalone then
       GameTooltip:AddLine("Rechtsklick: wieder ans Berufsfenster andocken (ohne Beruf: Bildschirmmitte)", 1, 1, 1)
-      GameTooltip:AddLine("Pfeile links/rechts: Beruf wechseln (wenn kein Berufsfenster offen ist)", 1, 1, 1)
+      GameTooltip:AddLine("Pfeile links/rechts: Berufe und Bilanz durchblättern", 1, 1, 1)
     else
       GameTooltip:AddLine("Rechtsklick: wieder am Berufsfenster andocken", 1, 1, 1)
     end
@@ -459,6 +479,18 @@ function ns.CreatePanel(parent, adapter)
         FauxScrollFrame_SetOffset(panel.scroll, 0)
         panel:Refresh()
       end)
+      -- greyed out: say why
+      b:SetMotionScriptsWhileDisabled(true)
+      b:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        if self:IsEnabled() then
+          GameTooltip:SetText(dir < 0 and "Zurück blättern (Berufe, Bilanz)" or "Weiter blättern (Berufe, Bilanz)")
+        else
+          GameTooltip:SetText(adapter.CycleHint and adapter.CycleHint() or "Kein weiterer Beruf", 1, 0.82, 0, 1, true)
+        end
+        GameTooltip:Show()
+      end)
+      b:SetScript("OnLeave", GameTooltip_Hide)
       return b
     end
     panel.prevButton = Arrow(-1, "TOPLEFT", 8)
@@ -474,6 +506,7 @@ function ns.CreatePanel(parent, adapter)
     b:SetHeight(20)
     b:SetText(text)
     b:SetScript("OnClick", function()
+      ns.balancePage = false
       ns.SetLearnMode(learn)
       FauxScrollFrame_SetOffset(panel.scroll, 0)
       panel:Refresh()
@@ -523,7 +556,15 @@ function ns.CreatePanel(parent, adapter)
   best.detail:SetPoint("RIGHT", best, "RIGHT", -10, 0)
   best.detail:SetJustifyH("LEFT")
   best.detail:SetWordWrap(false)
-  best:SetScript("OnEnter", function(self) if self.entry then ShowTooltip(self, self.entry) end end)
+  best:SetScript("OnEnter", function(self)
+    if self.entry then
+      ShowTooltip(self, self.entry)
+    elseif self.balance then
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      ns.Balance.SummaryTooltip(GameTooltip)
+      GameTooltip:Show()
+    end
+  end)
   best:SetScript("OnLeave", GameTooltip_Hide)
   best:SetScript("OnClick", function(self) OnEntryClick(adapter, self.entry) end)
   panel.best = best
@@ -549,6 +590,7 @@ function ns.CreatePanel(parent, adapter)
       GameTooltip:Show()
     end)
     cb:SetScript("OnLeave", GameTooltip_Hide)
+    panel.check3 = cb
   else
     local cb = MakeCheck(panel, "Kaufpreis", "usePaid", 245, y)
     cb:SetScript("OnEnter", function(self)
@@ -560,6 +602,7 @@ function ns.CreatePanel(parent, adapter)
     end)
     cb:SetScript("OnLeave", GameTooltip_Hide)
     panel.paidCheck = cb
+    panel.check3 = cb
   end
 
   -- Column headers ------------------------------------------------------------
@@ -656,13 +699,39 @@ function ns.CreatePanel(parent, adapter)
   function panel:Refresh()
     self:Reanchor()
     self:UpdateLedger()
-    if adapter.Title then self.title:SetText(adapter.Title()) end
+    local balance = adapter.standalone and ns.balancePage or false
+    if balance then
+      self.title:SetText("Bilanz – " .. ((adapter.ProfessionName and adapter.ProfessionName()) or "kein Beruf"))
+    elseif adapter.Title then
+      self.title:SetText(adapter.Title())
+    end
+    check1:SetShown(not balance)
+    check2:SetShown(not balance)
+    self.check3:SetShown(not balance)
+    hName:SetText(balance and "Herstellen / Material" or "#   Rezept")
+    hProfit:SetText(balance and "Gewinn / Wert" or "Gewinn / Stück")
+    best.balance = balance
     if self.prevButton then
       local multiple = adapter.Count and adapter.Count() > 1
       self.prevButton:SetEnabled(multiple)
       self.nextButton:SetEnabled(multiple)
     end
     if self.paidCheck then self.paidCheck:SetChecked(CraftSellDB.usePaid) end
+    if balance then
+      tabMine:UnlockHighlight()
+      tabLearn:UnlockHighlight()
+      local list, t = ns.Balance.Build(self.adapter)
+      self.list = list
+      best.entry = nil
+      best.icon:SetTexture("Interface\\Icons\\INV_Misc_Coin_02")
+      best.label:SetText("Bestand herstellen und verkaufen")
+      best.profit:SetText((t.profit > 0 and "|cff40ff40+|r" or "") .. Money(t.profit))
+      best.name:SetText("Einkauf " .. Money(t.spend) .. "   Verkauf " .. Money(t.income))
+      best.detail:SetText("|cffaaaaaa" .. t.crafts .. " Herstellungen   Rest-Material:|r " .. Money(t.restValue))
+      self.status:SetText("Kaufpreise aus dem Postfach, sonst Marktpreis  ·  " .. date("%H:%M:%S"))
+      self:UpdateRows()
+      return
+    end
     local learn = CraftSellDB.learnMode and true or false
     self.learn = learn
     if learn then
@@ -757,7 +826,11 @@ function ns.CreatePanel(parent, adapter)
         local rank = offset + i
         row.rank:SetText(rank == 1 and "|cffffd2001|r" or tostring(rank))
         row.icon:SetTexture(e.icon)
-        if e.learn then
+        if e.balance then
+          row.rank:SetText("")
+          row.name:SetText(e.title)
+          row.detail:SetText(e.detail or "")
+        elseif e.learn then
           row.name:SetText(LearnName(e))
           row.detail:SetText(LearnDetailText(e))
         else
@@ -766,7 +839,7 @@ function ns.CreatePanel(parent, adapter)
           row.name:SetText(name)
           row.detail:SetText(DetailText(e))
         end
-        row.profit:SetText(ProfitText(e))
+        row.profit:SetText(e.balance and (e.right or "") or ProfitText(e))
         row:Show()
       else
         row:Hide()

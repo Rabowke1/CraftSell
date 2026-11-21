@@ -150,6 +150,25 @@ local function Scan()
     table.insert(byKey[s.k], s)
   end
 
+  -- everything attached to the mails: owned, but not in the bags yet
+  local inbox = {}
+  for i = 1, GetInboxNumItems() or 0 do
+    for a = 1, ATTACHMENTS_MAX_RECEIVE or 16 do
+      local name, id, _, count = GetInboxItem(i, a)
+      if name then
+        if type(id) ~= "number" then
+          id = GetInboxItemLink and P.ItemIDFromLink(GetInboxItemLink(i, a))
+          count = nil
+        end
+        if id then inbox[id] = (inbox[id] or 0) + (tonumber(count) or 1) end
+      end
+    end
+  end
+  -- saved per character: survives /reload and relogging, replaced whenever
+  -- the mailbox is looked into again
+  CraftSellDB.mailbox = CraftSellDB.mailbox or {}
+  CraftSellDB.mailbox[char] = inbox
+
   local fresh = {}
   for i = 1, GetInboxNumItems() or 0 do
     -- "buyer" = invoice of an auction you won; bid = what you paid in total
@@ -195,8 +214,16 @@ local function Scan()
     table.sort(fresh, function(a, b) return a.t < b.t end)
     for _, f in ipairs(fresh) do AddLot(f.itemID, f.qty, f.cost, f.t) end
     Report(fresh)
-    if ns.ScheduleRefresh then ns.ScheduleRefresh(0.2) end
+    -- new purchases: show what they bring
+    if ns.ShowBalance then ns.ShowBalance(true) end
   end
+  if ns.ScheduleRefresh then ns.ScheduleRefresh(0.2) end
+end
+
+-- Amount of an item still lying in the mailbox (as of the last look into it).
+function M.InboxCount(itemID)
+  local box = CraftSellDB.mailbox and CraftSellDB.mailbox[ns.Ledger.CharKey()]
+  return (box and box[itemID]) or 0
 end
 
 -- ---------------------------------------------------------------------------

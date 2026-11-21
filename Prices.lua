@@ -53,6 +53,7 @@ local function VendorBuyPrice(itemID)
   end
   return best
 end
+P.VendorBuyPrice = VendorBuyPrice
 
 local function AuctioneerPrice(itemID)
   if AucAdvanced and AucAdvanced.API and AucAdvanced.API.GetMarketValue then
